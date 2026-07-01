@@ -102,6 +102,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.common_utils.cache_pydantic_utils import CacheCodec
 from litellm.proxy.common_utils.callback_utils import (
+    is_sensitive_callback_key,
     normalize_callback_names,
     process_callback,
 )
@@ -14311,6 +14312,32 @@ async def create_config_audit_log(
     )
 
 
+_EXTRA_SECRET_CALLBACK_ENV_VARS = frozenset(
+    {
+        "GALILEO_USERNAME",
+        "GENERIC_LOGGER_HEADERS",
+        "OTEL_HEADERS",
+        "SLACK_WEBHOOK_URL",
+        "SMTP_USERNAME",
+    }
+)
+
+
+def _redact_callback_env_vars(env_vars: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    """Return a copy of ``env_vars`` with values for keys classified as
+    sensitive by ``is_sensitive_callback_key`` replaced with ``"REDACTED"``.
+    ``None`` values pass through unchanged.
+    """
+    return {
+        key: (
+            "REDACTED"
+            if value is not None and is_sensitive_callback_key(key, extra=_EXTRA_SECRET_CALLBACK_ENV_VARS)
+            else value
+        )
+        for key, value in env_vars.items()
+    }
+
+
 @router.get(
     "/config/field/info",
     tags=["config.yaml"],
@@ -14721,7 +14748,9 @@ async def delete_callback(
     include_in_schema=False,
     dependencies=[Depends(user_api_key_auth)],
 )
-async def get_config():
+async def get_config(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
     """
     For Admin UI - allows admin to view config via UI
     # return the callbacks and the env variables for the callback
@@ -14735,6 +14764,8 @@ async def get_config():
         _litellm_settings = config_data.get("litellm_settings", {})
         _general_settings = config_data.get("general_settings", {})
         environment_variables = config_data.get("environment_variables", {})
+
+        is_full_admin = user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
 
         _success_callbacks = _litellm_settings.get("success_callback", [])
         _failure_callbacks = _litellm_settings.get("failure_callback", [])
@@ -14777,6 +14808,12 @@ async def get_config():
         for _callback in _success_and_failure_callbacks:
             _data_to_return.append(process_callback(_callback, "success_and_failure", environment_variables))
 
+        if not is_full_admin:
+            _data_to_return = [
+                {**entry, "variables": _redact_callback_env_vars(entry.get("variables") or {})}
+                for entry in _data_to_return
+            ]
+
         # Check if slack alerting is on
         _alerting = _general_settings.get("alerting", [])
         alerting_data = []
@@ -14788,11 +14825,16 @@ async def get_config():
                 _var: (value if (value := environment_variables.get(_var)) is not None else os.getenv(_var))
                 for _var in _slack_vars
             }
-            _slack_env_vars = mask_sensitive_keys(_slack_env_vars, _ALERTING_SENSITIVE_VARS)
+            if is_full_admin:
+                _slack_env_vars = mask_sensitive_keys(_slack_env_vars, _ALERTING_SENSITIVE_VARS)
+            else:
+                _slack_env_vars = _redact_callback_env_vars(_slack_env_vars)
 
             _alerting_types = proxy_logging_obj.slack_alerting_instance.alert_types
             _all_alert_types = proxy_logging_obj.slack_alerting_instance._all_possible_alert_types()
             _alerts_to_webhook = proxy_logging_obj.slack_alerting_instance.alert_to_webhook_url
+            if not is_full_admin and isinstance(_alerts_to_webhook, dict):
+                _alerts_to_webhook = {alert_type: "REDACTED" for alert_type in _alerts_to_webhook}
             alerting_data.append(
                 {
                     "name": "slack",
@@ -14813,7 +14855,10 @@ async def get_config():
             "EMAIL_SUPPORT_CONTACT",
         ]
         _email_env_vars = {_var: environment_variables.get(_var) for _var in _email_vars}
-        _email_env_vars = mask_sensitive_keys(_email_env_vars, _ALERTING_SENSITIVE_VARS)
+        if is_full_admin:
+            _email_env_vars = mask_sensitive_keys(_email_env_vars, _ALERTING_SENSITIVE_VARS)
+        else:
+            _email_env_vars = _redact_callback_env_vars(_email_env_vars)
 
         alerting_data.append(
             {
